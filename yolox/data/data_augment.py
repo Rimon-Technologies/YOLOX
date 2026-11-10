@@ -165,10 +165,13 @@ class TrainTransform:
         self.hsv_prob = hsv_prob
 
     def __call__(self, image, targets, input_dim):
+        # Rimon fork: every column after the box (the class and the label
+        # flags) rides along unchanged; the output row is
+        # [cls, cx, cy, w, h, flags...] with the width of the input row.
         boxes = targets[:, :4].copy()
-        labels = targets[:, 4].copy()
+        extras = targets[:, 4:].copy()
         if len(boxes) == 0:
-            targets = np.zeros((self.max_labels, 5), dtype=np.float32)
+            targets = np.zeros((self.max_labels, targets.shape[1]), dtype=np.float32)
             image, r_o = preproc(image, input_dim)
             return image, targets
 
@@ -176,7 +179,7 @@ class TrainTransform:
         targets_o = targets.copy()
         height_o, width_o, _ = image_o.shape
         boxes_o = targets_o[:, :4]
-        labels_o = targets_o[:, 4]
+        extras_o = targets_o[:, 4:]
         # bbox_o: [xyxy] to [c_x,c_y,w,h]
         boxes_o = xyxy2cxcywh(boxes_o)
 
@@ -191,18 +194,16 @@ class TrainTransform:
 
         mask_b = np.minimum(boxes[:, 2], boxes[:, 3]) > 1
         boxes_t = boxes[mask_b]
-        labels_t = labels[mask_b]
+        extras_t = extras[mask_b]
 
         if len(boxes_t) == 0:
             image_t, r_o = preproc(image_o, input_dim)
             boxes_o *= r_o
             boxes_t = boxes_o
-            labels_t = labels_o
+            extras_t = extras_o
 
-        labels_t = np.expand_dims(labels_t, 1)
-
-        targets_t = np.hstack((labels_t, boxes_t))
-        padded_labels = np.zeros((self.max_labels, 5))
+        targets_t = np.hstack((extras_t[:, :1], boxes_t, extras_t[:, 1:]))
+        padded_labels = np.zeros((self.max_labels, targets_t.shape[1]))
         padded_labels[range(len(targets_t))[: self.max_labels]] = targets_t[
             : self.max_labels
         ]

@@ -9,7 +9,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from yolox.utils import bboxes_iou, cxcywh2xyxy, meshgrid, visualize_assign
+from yolox.utils import (
+    CLS_MASKED_COL,
+    IGNORE_COL,
+    bboxes_iou,
+    cxcywh2xyxy,
+    meshgrid,
+    visualize_assign,
+)
 
 from .losses import IOUloss
 from .network_blocks import BaseConv, DWConv
@@ -268,7 +275,14 @@ class YOLOXHead(nn.Module):
         cls_preds = outputs[:, :, 5:]  # [batch, n_anchors_all, n_cls]
 
         # calculate targets
-        nlabel = (labels.sum(dim=2) > 0).sum(dim=1)  # number of objects
+        nlabel = (labels.sum(dim=2) > 0).sum(dim=1)  # number of label rows
+
+        # Rimon fork: label rows may carry the two flags of yolox.utils.boxes
+        # after the box. Ignore rows are don't-care regions: they take no part
+        # in the assignment and anchors whose centre falls inside one get no
+        # negative objectness loss. cls_masked rows train objectness and box
+        # but contribute no class loss.
+        has_flags = labels.shape[2] > CLS_MASKED_COL
 
         total_num_anchors = outputs.shape[1]
         x_shifts = torch.cat(x_shifts, 1)  # [1, n_anchors_all]
@@ -282,12 +296,23 @@ class YOLOXHead(nn.Module):
         l1_targets = []
         obj_targets = []
         fg_masks = []
+        obj_weights = []
+        cls_weights = []
 
         num_fg = 0.0
         num_gts = 0.0
 
         for batch_idx in range(outputs.shape[0]):
-            num_gt = int(nlabel[batch_idx])
+            rows = labels[batch_idx, :int(nlabel[batch_idx])]
+            if has_flags:
+                is_ignore = rows[:, IGNORE_COL] > 0.5
+                is_masked = rows[:, CLS_MASKED_COL] > 0.5
+            else:
+                is_ignore = torch.zeros(rows.shape[0], dtype=torch.bool, device=rows.device)
+                is_masked = is_ignore
+            gt_rows = rows[~is_ignore]
+            ignore_bboxes = rows[is_ignore, 1:5]
+            num_gt = int(gt_rows.shape[0])
             num_gts += num_gt
             if num_gt == 0:
                 cls_target = outputs.new_zeros((0, self.num_classes))
@@ -295,9 +320,11 @@ class YOLOXHead(nn.Module):
                 l1_target = outputs.new_zeros((0, 4))
                 obj_target = outputs.new_zeros((total_num_anchors, 1))
                 fg_mask = outputs.new_zeros(total_num_anchors).bool()
+                cls_weight = outputs.new_zeros((0,))
             else:
-                gt_bboxes_per_image = labels[batch_idx, :num_gt, 1:5]
-                gt_classes = labels[batch_idx, :num_gt, 0]
+                gt_bboxes_per_image = gt_rows[:, 1:5]
+                gt_classes = gt_rows[:, 0]
+                gt_cls_masked = is_masked[~is_ignore]
                 bboxes_preds_per_image = bbox_preds[batch_idx]
 
                 try:
@@ -318,6 +345,7 @@ class YOLOXHead(nn.Module):
                         y_shifts,
                         cls_preds,
                         obj_preds,
+                        gt_cls_masked=gt_cls_masked,
                     )
                 except RuntimeError as e:
                     # TODO: the string might change, consider a better way
@@ -348,6 +376,7 @@ class YOLOXHead(nn.Module):
                         cls_preds,
                         obj_preds,
                         "cpu",
+                        gt_cls_masked=gt_cls_masked,
                     )
 
                 torch.cuda.empty_cache()
@@ -358,6 +387,7 @@ class YOLOXHead(nn.Module):
                 ) * pred_ious_this_matching.unsqueeze(-1)
                 obj_target = fg_mask.unsqueeze(-1)
                 reg_target = gt_bboxes_per_image[matched_gt_inds]
+                cls_weight = (~gt_cls_masked[matched_gt_inds]).to(dtype)
                 if self.use_l1:
                     l1_target = self.get_l1_target(
                         outputs.new_zeros((num_fg_img, 4)),
@@ -367,10 +397,20 @@ class YOLOXHead(nn.Module):
                         y_shifts=y_shifts[0][fg_mask],
                     )
 
+            if ignore_bboxes.shape[0] > 0:
+                in_ignore = self.anchors_in_boxes(
+                    ignore_bboxes, expanded_strides, x_shifts, y_shifts
+                )
+                obj_weight = (~(in_ignore & ~fg_mask)).to(dtype)
+            else:
+                obj_weight = outputs.new_ones(total_num_anchors)
+
             cls_targets.append(cls_target)
             reg_targets.append(reg_target)
             obj_targets.append(obj_target.to(dtype))
             fg_masks.append(fg_mask)
+            obj_weights.append(obj_weight.unsqueeze(-1))
+            cls_weights.append(cls_weight)
             if self.use_l1:
                 l1_targets.append(l1_target)
 
@@ -378,6 +418,8 @@ class YOLOXHead(nn.Module):
         reg_targets = torch.cat(reg_targets, 0)
         obj_targets = torch.cat(obj_targets, 0)
         fg_masks = torch.cat(fg_masks, 0)
+        obj_weights = torch.cat(obj_weights, 0)
+        cls_weights = torch.cat(cls_weights, 0)
         if self.use_l1:
             l1_targets = torch.cat(l1_targets, 0)
 
@@ -386,12 +428,12 @@ class YOLOXHead(nn.Module):
             self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets)
         ).sum() / num_fg
         loss_obj = (
-            self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets)
+            self.bcewithlog_loss(obj_preds.view(-1, 1), obj_targets) * obj_weights
         ).sum() / num_fg
         loss_cls = (
             self.bcewithlog_loss(
                 cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets
-            )
+            ).sum(1) * cls_weights
         ).sum() / num_fg
         if self.use_l1:
             loss_l1 = (
@@ -411,6 +453,19 @@ class YOLOXHead(nn.Module):
             loss_l1,
             num_fg / max(num_gts, 1),
         )
+
+    @staticmethod
+    def anchors_in_boxes(bboxes, expanded_strides, x_shifts, y_shifts):
+        """Rimon fork. Bool [n_anchors]: the anchor centre lies inside at
+        least one of the [cx, cy, w, h] boxes (input pixels)."""
+        stride = expanded_strides[0]
+        xc = ((x_shifts[0] + 0.5) * stride).unsqueeze(0)
+        yc = ((y_shifts[0] + 0.5) * stride).unsqueeze(0)
+        half_w = bboxes[:, 2:3] * 0.5
+        half_h = bboxes[:, 3:4] * 0.5
+        in_x = (xc >= bboxes[:, 0:1] - half_w) & (xc <= bboxes[:, 0:1] + half_w)
+        in_y = (yc >= bboxes[:, 1:2] - half_h) & (yc <= bboxes[:, 1:2] + half_h)
+        return (in_x & in_y).any(dim=0)
 
     def get_l1_target(self, l1_target, gt, stride, x_shifts, y_shifts, eps=1e-8):
         l1_target[:, 0] = gt[:, 0] / stride - x_shifts
@@ -433,6 +488,7 @@ class YOLOXHead(nn.Module):
         cls_preds,
         obj_preds,
         mode="gpu",
+        gt_cls_masked=None,
     ):
 
         if mode == "cpu":
@@ -443,6 +499,8 @@ class YOLOXHead(nn.Module):
             expanded_strides = expanded_strides.cpu().float()
             x_shifts = x_shifts.cpu()
             y_shifts = y_shifts.cpu()
+            if gt_cls_masked is not None:
+                gt_cls_masked = gt_cls_masked.cpu()
 
         fg_mask, geometry_relation = self.get_geometry_constraint(
             gt_bboxes_per_image,
@@ -481,6 +539,13 @@ class YOLOXHead(nn.Module):
                 reduction="none"
             ).sum(-1)
         del cls_preds_
+
+        if gt_cls_masked is not None and bool(gt_cls_masked.any()):
+            # Rimon fork: a class-masked gt has no class to match against, so
+            # its anchors are picked on geometry and IoU alone.
+            pair_wise_cls_loss = pair_wise_cls_loss * (
+                ~gt_cls_masked
+            ).to(pair_wise_cls_loss.dtype).unsqueeze(1)
 
         cost = (
             pair_wise_cls_loss
@@ -613,10 +678,13 @@ class YOLOXHead(nn.Module):
         y_shifts = torch.cat(y_shifts, 1)  # [1, n_anchors_all]
         expanded_strides = torch.cat(expanded_strides, 1)
 
-        nlabel = (labels.sum(dim=2) > 0).sum(dim=1)  # number of objects
-        for batch_idx, (img, num_gt, label) in enumerate(zip(imgs, nlabel, labels)):
+        nlabel = (labels.sum(dim=2) > 0).sum(dim=1)  # number of label rows
+        for batch_idx, (img, num_rows, label) in enumerate(zip(imgs, nlabel, labels)):
             img = imgs[batch_idx].permute(1, 2, 0).to(torch.uint8)
-            num_gt = int(num_gt)
+            label = label[:int(num_rows)]
+            if labels.shape[2] > IGNORE_COL:
+                label = label[label[:, IGNORE_COL] <= 0.5]  # Rimon fork: ignore rows are not gts
+            num_gt = int(label.shape[0])
             if num_gt == 0:
                 fg_mask = outputs.new_zeros(total_num_anchors).bool()
             else:

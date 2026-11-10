@@ -7,6 +7,10 @@ import torch
 import torchvision
 
 __all__ = [
+    "LABEL_FLAGS",
+    "LABEL_WIDTH",
+    "IGNORE_COL",
+    "CLS_MASKED_COL",
     "filter_box",
     "postprocess",
     "bboxes_iou",
@@ -16,6 +20,19 @@ __all__ = [
     "xyxy2cxcywh",
     "cxcywh2xyxy",
 ]
+
+# Rimon fork. A label row is [x0, y0, x1, y1, cls] in dataset space and
+# [cls, cx, cy, w, h] after TrainTransform, followed in both by two flags:
+#   ignore      1 = don't-care region: never a positive in the assignment, and
+#               anchors whose centre falls inside it get no negative
+#               objectness loss (the CrowdHuman / WIDER Face recipe)
+#   cls_masked  1 = train objectness and box for this gt, not its class
+# Both are 0 for a plain box, so an all-zero row still means padding, and a
+# label without the flag columns (an older 5-wide row) reads as all zero.
+LABEL_FLAGS = ("ignore", "cls_masked")
+LABEL_WIDTH = 5 + len(LABEL_FLAGS)
+IGNORE_COL = 5
+CLS_MASKED_COL = 6
 
 
 def filter_box(output, scale_range):

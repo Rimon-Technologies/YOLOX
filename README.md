@@ -1,3 +1,17 @@
+> **Rimon fork**, branch `rimon` of [Megvii-BaseDetection/YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) (Apache-2.0),
+> used by `computer-vision-detectors`. Changes against upstream:
+> - COCO annotations with `iscrowd` / `ignore` are kept as **ignore regions** and ones with
+>   `class_masked` as **class-masked boxes**, carried as two flag columns on every label row
+>   (`yolox/utils/boxes.py`) through `COCODataset`, `TrainTransform`, mosaic and mixup.
+> - `YOLOXHead.get_losses`: anchors whose centre falls inside an ignore region are excluded from
+>   the negative objectness loss and ignore rows never become positives; class-masked boxes train
+>   objectness and box but not the class (`yolox/models/yolo_head.py`).
+> - Packaging: the fast COCOeval extension is built only with `YOLOX_BUILD_EXT=1`, so the package
+>   installs from git without torch at build time (the op is JIT-built on first use, with a
+>   pycocotools fallback); `opencv` is left to the installing project and `onnx` is an extra.
+> - `COCOEvaluator` runs on the device the model is on (cpu, mps), not only cuda.
+> - Tests for the above: `python -m pytest tests/data tests/models`.
+
 <div align="center"><img src="assets/logo.png" width="350"></div>
 <img src="assets/demo.png" >
 

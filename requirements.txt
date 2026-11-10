@@ -1,10 +1,11 @@
-# TODO: Update with exact module version
+# Rimon fork: the runtime set only. opencv is left to the installing project
+# (opencv-python or opencv-python-headless both provide cv2); onnx and
+# onnx-simplifier are the `onnx` extra.
 numpy
 torch>=1.7
-opencv_python
+torchvision
 loguru
 tqdm
-torchvision
 thop
 ninja
 tabulate
@@ -14,5 +15,3 @@ tensorboard
 # verified versions
 # pycocotools corresponds to https://github.com/ppwwyyxx/cocoapi
 pycocotools>=2.0.2
-onnx>=1.13.0
-onnx-simplifier==0.4.10

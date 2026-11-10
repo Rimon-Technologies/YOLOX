@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from pycocotools.coco import COCO
 
+from yolox.utils import CLS_MASKED_COL, IGNORE_COL, LABEL_WIDTH
+
 from ..dataloading import get_yolox_datadir
 from .datasets_wrapper import CacheDataset, cache_read_img
 
@@ -93,7 +95,10 @@ class COCODataset(CacheDataset):
         im_ann = self.coco.loadImgs(id_)[0]
         width = im_ann["width"]
         height = im_ann["height"]
-        anno_ids = self.coco.getAnnIds(imgIds=[int(id_)], iscrowd=False)
+        # Rimon fork: crowd / ignore annotations are kept as ignore regions
+        # (flag column) instead of being dropped, which would turn them into
+        # negatives that look like positives.
+        anno_ids = self.coco.getAnnIds(imgIds=[int(id_)], iscrowd=None)
         annotations = self.coco.loadAnns(anno_ids)
         objs = []
         for obj in annotations:
@@ -107,11 +112,13 @@ class COCODataset(CacheDataset):
 
         num_objs = len(objs)
 
-        res = np.zeros((num_objs, 5))
+        res = np.zeros((num_objs, LABEL_WIDTH))
         for ix, obj in enumerate(objs):
             cls = self.class_ids.index(obj["category_id"])
             res[ix, 0:4] = obj["clean_bbox"]
             res[ix, 4] = cls
+            res[ix, IGNORE_COL] = float(bool(obj.get("ignore", obj.get("iscrowd", 0))))
+            res[ix, CLS_MASKED_COL] = float(bool(obj.get("class_masked", 0)))
 
         r = min(self.img_size[0] / height, self.img_size[1] / width)
         res[:, :4] *= r
@@ -172,11 +179,12 @@ class COCODataset(CacheDataset):
         Returns:
             img (numpy.ndarray): pre-processed image
             padded_labels (torch.Tensor): pre-processed label data.
-                The shape is :math:`[max_labels, 5]`.
-                each label consists of [class, xc, yc, w, h]:
+                The shape is :math:`[max_labels, 7]`.
+                each label consists of [class, xc, yc, w, h, ignore, cls_masked]:
                     class (float): class index.
                     xc, yc (float) : center of bbox whose values range from 0 to 1.
                     w, h (float) : size of bbox whose values range from 0 to 1.
+                    ignore, cls_masked (float): the flags of yolox.utils.boxes.
             info_img : tuple of h, w.
                 h, w (int): original shape of the image
             img_id (int): same as the input index. Used for evaluation.

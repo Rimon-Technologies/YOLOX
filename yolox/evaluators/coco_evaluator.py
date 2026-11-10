@@ -132,7 +132,10 @@ class COCOEvaluator:
             summary (sr): summary info of evaluation.
         """
         # TODO half to amp_test
-        tensor_type = torch.cuda.HalfTensor if half else torch.cuda.FloatTensor
+        # Rimon fork: evaluate on whatever device the model is on (cpu, mps),
+        # not only cuda.
+        device = next(model.parameters()).device
+        dtype = torch.float16 if half else torch.float32
         model = model.eval()
         if half:
             model = model.half()
@@ -159,7 +162,7 @@ class COCOEvaluator:
             progress_bar(self.dataloader)
         ):
             with torch.no_grad():
-                imgs = imgs.type(tensor_type)
+                imgs = imgs.to(device=device, dtype=dtype)
 
                 # skip the last iters since batchsize might be not enough for batch inference
                 is_time_record = cur_iter < len(self.dataloader) - 1
@@ -186,7 +189,7 @@ class COCOEvaluator:
             data_list.extend(data_list_elem)
             output_data.update(image_wise_data)
 
-        statistics = torch.cuda.FloatTensor([inference_time, nms_time, n_samples])
+        statistics = torch.tensor([inference_time, nms_time, n_samples], device=device)
         if distributed:
             # different process/device might have different speed,
             # to make sure the process will not be stucked, sync func is used here.
@@ -292,12 +295,15 @@ class COCOEvaluator:
                 cocoDt = cocoGt.loadRes(tmp)
             try:
                 from yolox.layers import COCOeval_opt as COCOeval
-            except ImportError:
+
+                cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
+            except Exception:
+                # Rimon fork: also when the op is not prebuilt and the JIT
+                # build fails (no compiler); pycocotools gives the same numbers.
                 from pycocotools.cocoeval import COCOeval
 
                 logger.warning("Use standard COCOeval.")
-
-            cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
+                cocoEval = COCOeval(cocoGt, cocoDt, annType[1])
             cocoEval.evaluate()
             cocoEval.accumulate()
             redirect_string = io.StringIO()

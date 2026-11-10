@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # Copyright (c) Megvii, Inc. and its affiliates. All Rights Reserved
 
+import os
 import re
 import setuptools
 import sys
@@ -45,8 +46,12 @@ def get_long_description():
 
 
 def get_ext_modules():
+    # Rimon fork: the fast COCOeval op is pre-compiled only on request
+    # (YOLOX_BUILD_EXT=1), so the package installs from a plain checkout with
+    # no torch in the build environment. Without it the op is JIT-compiled on
+    # first use, and the evaluator falls back to pycocotools if that fails.
     ext_module = []
-    if sys.platform != "win32":  # pre-compile ops on linux
+    if os.environ.get("YOLOX_BUILD_EXT") == "1" and sys.platform != "win32":
         assert TORCH_AVAILABLE, "torch is required for pre-compiling ops, please install it first."
         # if any other op is added, please also add it here
         from yolox.layers import FastCOCOEvalOp
@@ -70,6 +75,7 @@ setuptools.setup(
     packages=setuptools.find_packages(exclude=("tests", "tools")) + list(get_package_dir().keys()),
     python_requires=">=3.6",
     install_requires=get_install_requirements(),
+    extras_require={"onnx": ["onnx>=1.13.0", "onnx-simplifier"]},
     setup_requires=["wheel"],  # avoid building error when pip is not updated
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
